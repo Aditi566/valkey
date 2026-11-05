@@ -101,6 +101,15 @@ struct DefragContext {
 };
 static struct DefragContext defrag;
 
+/* Diagnostic-only timing for the slowest kvstore hash-table scan in a cycle. */
+static struct {
+    monotime max_scan_us;
+    int slot;
+    unsigned long cursor;
+    unsigned long long scanned;
+    long long hits;
+} defrag_scan_diag;
+
 
 /* There are a number of stages which process a kvstore.  To simplify this, a stage helper function
  * `defragStageKvstoreHelper()` is defined.  This function aids in iterating over the kvstore.  It
@@ -907,9 +916,21 @@ static doneStatus defragStageKvstoreHelper(monotime endtime,
 
         // Whatever privdata's actual type, this function requires that it begins with kvstoreIterState.
         if (privdata) *(kvstoreIterState *)privdata = state;
+        monotime scan_start = getMonotonicUs();
+        unsigned long long scanned_before = server.stat_active_defrag_scanned;
+        long long hits_before = server.stat_active_defrag_hits;
+        unsigned long scan_cursor = state.cursor;
         state.cursor = kvstoreHashtableScanDefrag(kvs, state.slot, state.cursor,
                                                   scan_fn, privdata, activeDefragAlloc,
                                                   HASHTABLE_SCAN_EMIT_REF);
+        monotime scan_duration = getMonotonicUs() - scan_start;
+        if (scan_duration > defrag_scan_diag.max_scan_us) {
+            defrag_scan_diag.max_scan_us = scan_duration;
+            defrag_scan_diag.slot = state.slot;
+            defrag_scan_diag.cursor = scan_cursor;
+            defrag_scan_diag.scanned = server.stat_active_defrag_scanned - scanned_before;
+            defrag_scan_diag.hits = server.stat_active_defrag_hits - hits_before;
+        }
     }
 
     return DEFRAG_NOT_DONE;
@@ -1160,6 +1181,7 @@ static long long activeDefragTimeProc(struct aeEventLoop *eventLoop, long long i
     monotime endtime = starttime + dutyCycleUs;
     bool haveMoreWork = true;
 
+    defrag_scan_diag.max_scan_us = 0;
     mstime_t latency;
     latencyStartMonitor(latency);
 
@@ -1185,6 +1207,12 @@ static long long activeDefragTimeProc(struct aeEventLoop *eventLoop, long long i
     } while (haveMoreWork && getMonotonicUs() <= endtime - server.active_defrag_cycle_us);
 
     latencyEndMonitor(latency);
+    if (defrag_scan_diag.max_scan_us > server.active_defrag_cycle_us) {
+        serverLog(LL_NOTICE,
+                  "Active defrag diagnostic: slowest hashtable scan=%lldus slot=%d cursor=%lu scanned=%llu hits=%lld",
+                  (long long)defrag_scan_diag.max_scan_us, defrag_scan_diag.slot,
+                  defrag_scan_diag.cursor, defrag_scan_diag.scanned, defrag_scan_diag.hits);
+    }
     latencyAddSampleIfNeeded("active-defrag-cycle", latency);
     latencyTraceIfNeeded(db, active_defrag_cycle, latency);
     if (haveMoreWork) {
